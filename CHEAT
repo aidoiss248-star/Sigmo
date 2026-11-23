@@ -1,0 +1,1237 @@
+--[[
+    SIGMO CHEAT V11 | BLACK SNOW EDITION
+    JUMP/FALL LEAD + RUNNER PREDICTION + ZERO SPREAD + BOX ESP
+
+    Complete single-file Luau executor script.
+    Reskinned GUI: deep-black square cards + falling snowflakes.
+    CTRL = hide/show menu; X = turn off/clean up.
+
+    Silent Aim / ESP / No Recoil start OFF.
+    Original V10 aim and ESP logic preserved.
+
+    The client has no artificial world-distance target limit.
+    The game server may still enforce projectile lifetime, range,
+    collision, and shot validation. This script cannot remove those.
+    No Recoil removes client-side camera recoil AND neutralizes transmitted shot cone.
+    Server-side weapon spread, collision, and range remain under server control.
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local LP = Players.LocalPlayer
+local ENV = (getgenv and getgenv()) or _G
+
+if ENV.VoxelSilentAim and type(ENV.VoxelSilentAim.Stop) == "function" then
+    pcall(ENV.VoxelSilentAim.Stop)
+end
+
+local CFG = {
+    fov = 190, minFov = 40, maxFov = 750,
+    hitChance = 100, headChance = 25,
+    wallcheck = true, wallbang = false, players = true, bots = true,
+    noRecoil = false, -- Camera recoil + client shot spread together
+    visualTracers = true,
+    longRangePrediction = true,
+    airLead = true, -- Predict jump/fall using gravity and landing height
+    strafeLead = true, -- Predict recent acceleration on X/Z
+    autoBodyFar = true, farBodyDistance = 800,
+    pingFactor = 100, -- percent of measured latency
+    maxPredictionTime = 8, -- prediction only, NOT projectile range
+    boxPadding = 0.5,
+    espTeam = false,
+    boxColor = Color3.fromRGB(220, 115, 210),
+    gradientEnabled = true,
+    gradientStrength = 55,
+    gradientDirection = 1,
+}
+
+local S = {
+    running = true, silent = false, esp = false, showCircle = true,
+    noRecoil = false, recoilReady = false, recoilMode = "UNAVAILABLE",
+    hookReady = false, tracerReady = false,
+    shots = 0, modified = 0, straightened = 0, visuals = 0, errors = 0,
+    target = nil, targetTime = 0, targetName = "NONE", targetDistance = 0,
+    velocityMultiplier = 1, networkPing = 0, visualShot = nil,
+    lastFlightTime = 0, lastLeadDistance = 0,
+    connections = {}, boxes = {},
+}
+ENV.VoxelSilentAim = S
+
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(S.connections, c)
+    return c
+end
+
+local Voxel = RS:WaitForChild("Voxel")
+local Remotes = Voxel:WaitForChild("Remotes")
+local FIRE = {}
+for _, name in ipairs({
+    "FireRifle", "FireSMG", "FireLMG", "FirePistol",
+    "FireDMR", "FireSniper", "FireShotgun"
+}) do
+    local r = Remotes:FindFirstChild(name)
+    if r and r:IsA("RemoteEvent") then FIRE[r] = name end
+end
+
+local Ballistics
+pcall(function()
+    Ballistics = require(Voxel:WaitForChild("Ballistics", 5))
+end)
+
+
+-- =====================================
+-- NO RECOIL: GAME'S GUNRECOIL CLASS
+-- =====================================
+-- The rifle controller calls GunRecoil.new(weaponName) once, then
+-- uses recoilInstance:shot() and recoilInstance:step(dt).
+-- Intercepting these methods preserves FireServer, ammo, sound,
+-- and ordinary gun firing behavior. This only affects CLIENT recoil.
+local recoilOriginals = {}
+local recoilPrototypes = {}
+
+local function patchRecoilPrototype(proto)
+    if type(proto) ~= "table" or recoilOriginals[proto] then return false end
+    local originalShot = rawget(proto, "shot")
+    local originalStep = rawget(proto, "step")
+    if type(originalShot) ~= "function" or type(originalStep) ~= "function" then
+        return false
+    end
+
+    local replacementShot = function(self, ...)
+        if S.running and S.noRecoil then
+            if type(self) == "table" then
+                self.pitch = 0
+                self.yaw = 0
+            end
+            return nil
+        end
+        return originalShot(self, ...)
+    end
+
+    local replacementStep = function(self, ...)
+        if S.running and S.noRecoil then
+            if type(self) == "table" then
+                self.pitch = 0
+                self.yaw = 0
+            end
+            return 0, 0, 0
+        end
+        return originalStep(self, ...)
+    end
+
+    local ok = pcall(function()
+        proto.shot = replacementShot
+        proto.step = replacementStep
+    end)
+    if ok and proto.shot == replacementShot and proto.step == replacementStep then
+        recoilOriginals[proto] = {
+            shot = originalShot,
+            step = originalStep,
+            replacementShot = replacementShot,
+            replacementStep = replacementStep,
+        }
+        table.insert(recoilPrototypes, proto)
+        return true
+    end
+    return false
+end
+
+pcall(function()
+    local module = Voxel:FindFirstChild("GunRecoil")
+    if not module then return end
+    local gunRecoil = require(module)
+    if type(gunRecoil) ~= "table" then return end
+
+    -- Most Luau class modules expose :shot and :step on the class table.
+    if patchRecoilPrototype(gunRecoil) then
+        S.recoilReady = true
+        S.recoilMode = "GUN RECOIL"
+        return
+    end
+
+    -- Some modules store the methods in a distinct metatable __index.
+    -- Probe without changing the shot logic or assuming a live weapon.
+    if type(gunRecoil.new) == "function" then
+        local ok, probe = pcall(gunRecoil.new, "AssaultRifle")
+        if ok and type(probe) == "table" then
+            local mt = getmetatable(probe)
+            if type(mt) == "table" and type(mt.__index) == "table" then
+                if patchRecoilPrototype(mt.__index) then
+                    S.recoilReady = true
+                    S.recoilMode = "GUN RECOIL"
+                end
+            end
+        end
+    end
+end)
+
+
+local function alive(model)
+    if not model or model:GetAttribute("Alive") == false or model:GetAttribute("Protected") == true then
+        return false
+    end
+    local h = model:FindFirstChildOfClass("Humanoid")
+    return h ~= nil and h.Health > 0
+end
+
+local function enemy(pl)
+    if pl == LP then return false end
+    if LP.Team and pl.Team and not LP.Neutral and not pl.Neutral then
+        return pl.Team ~= LP.Team
+    end
+    return true
+end
+
+local function visibleESP(pl)
+    return pl ~= LP and (CFG.espTeam or enemy(pl))
+end
+
+local function parts(model)
+    local head = model:FindFirstChild("Head")
+    local torso = model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
+        or model:FindFirstChild("HumanoidRootPart")
+    return head, torso
+end
+
+-- Lightweight motion history, keyed by actual root parts. The values come
+-- from replicated physics and should not be treated as exact future motion.
+local motionHistory = setmetatable({}, {__mode = "k"})
+local function updateMotion(root)
+    if not root then return Vector3.zero end
+    local now = os.clock()
+    local velocity = root.AssemblyLinearVelocity
+    local record = motionHistory[root]
+    if not record then
+        record = {velocity = velocity, t = now, acceleration = Vector3.zero}
+        motionHistory[root] = record
+        return Vector3.zero
+    end
+    local dt = now - record.t
+    if dt >= .025 then
+        -- Reject large replication discontinuities instead of making
+        -- an unstable lead that can overshoot a suddenly turning player.
+        if dt < .4 then
+            local a = (velocity - record.velocity) / dt
+            a = Vector3.new(a.X, 0, a.Z)
+            local limit = 120
+            if a.Magnitude > limit then a = a.Unit * limit end
+            record.acceleration = record.acceleration:Lerp(a, .23)
+        else
+            record.acceleration = Vector3.zero
+        end
+        record.velocity, record.t = velocity, now
+    end
+    return record.acceleration
+end
+
+-- Target acquisition works in SCREEN PIXELS, irrespective of world distance.
+-- Never calls a distance < 500 condition or hooks workspace:Raycast.
+local function pick()
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local center = cam.ViewportSize * 0.5
+    local origin = cam.CFrame.Position
+    local bestDist, best = CFG.fov, nil
+    local exclude = {cam}
+    if LP.Character then table.insert(exclude, LP.Character) end
+    for _, n in ipairs({"VoxelChips", "VoxelLoose", "VoxelTracers", "VoxelGrenades", "VoxelFireFX"}) do
+        local found = workspace:FindFirstChild(n)
+        if found then table.insert(exclude, found) end
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    local function consider(model, name)
+        if not alive(model) then return end
+        local head, body = parts(model)
+        local focus = body or head
+        if not focus then return end
+        local screen, on = cam:WorldToViewportPoint(focus.Position)
+        if not on or screen.Z <= 0 then return end
+        local d = (Vector2.new(screen.X, screen.Y) - center).Magnitude
+        if d >= bestDist then return end
+        if CFG.wallcheck and not CFG.wallbang then
+            local filter = table.clone(exclude)
+            table.insert(filter, model)
+            params.FilterDescendantsInstances = filter
+            if workspace:Raycast(origin, focus.Position - origin, params) then return end
+        end
+        local root = model:FindFirstChild("HumanoidRootPart")
+        bestDist = d
+        best = {
+            name = name,
+            model = model,
+            root = root,
+            headPart = head,
+            bodyPart = body,
+            head = head and head.Position or nil,
+            body = body and body.Position or nil,
+            velocity = root and root.AssemblyLinearVelocity or Vector3.zero,
+            acceleration = root and updateMotion(root) or Vector3.zero,
+            distance = (focus.Position - origin).Magnitude,
+        }
+    end
+
+    if CFG.players then
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if enemy(pl) and pl.Character then consider(pl.Character, pl.Name) end
+        end
+    end
+    if CFG.bots then
+        local rigs = workspace:FindFirstChild("BotRigs")
+        if rigs then
+            local myTeam = LP.Team and LP.Team.Name or nil
+            for _, model in ipairs(rigs:GetChildren()) do
+                if not myTeam or tostring(model:GetAttribute("Team")) ~= myTeam then
+                    consider(model, model.Name)
+                end
+            end
+        end
+    end
+    return best
+end
+
+local refreshClock, pingClock = 0, 0
+bind(RunService.Heartbeat, function(dt)
+    if not S.running then return end
+    refreshClock += dt
+    pingClock += dt
+    if pingClock >= 1 then
+        pingClock = 0
+        local ok, ping = pcall(function() return LP:GetNetworkPing() end)
+        if ok and type(ping) == "number" then
+            S.networkPing = math.clamp(ping, 0, 0.5)
+        end
+    end
+    if refreshClock < 0.045 then return end
+    refreshClock = 0
+    if not S.silent then
+        S.target, S.targetName, S.targetDistance = nil, "NONE", 0
+        return
+    end
+    local ok, target = pcall(pick)
+    if ok and target then
+        S.target = target
+        S.targetName = target.name
+        S.targetDistance = target.distance
+        S.targetTime = os.clock()
+    else
+        S.target, S.targetName, S.targetDistance = nil, "NONE", 0
+    end
+    local tool = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+    S.velocityMultiplier = tool and tonumber(tool:GetAttribute("GsVelocity")) or 1
+end)
+
+-- Travel-time estimate with safe fallback. It does NOT extend server bullet lifetime.
+local function flightTime(distance, speed, arc)
+    speed = math.max(1, speed)
+    local fallback = distance / speed
+    if Ballistics and type(Ballistics.flightTime) == "function" then
+        local ok, t = pcall(Ballistics.flightTime, distance, speed, arc)
+        if ok and type(t) == "number" and t == t and t > 0 and t < math.huge then
+            return math.clamp(t, 0, CFG.maxPredictionTime)
+        end
+    end
+    return math.clamp(fallback, 0, CFG.maxPredictionTime)
+end
+
+-- Estimate the future point for a moving / jumping target.
+-- The weapon remains server-controlled: this predicts where to aim;
+-- it cannot extend server range or guarantee the shot will be accepted.
+local function predictTargetPosition(model, root, humanoid, point, velocity, acceleration, seconds, groundCache)
+    local t = math.clamp(seconds, 0, CFG.maxPredictionTime)
+    local move = velocity * t
+
+    if CFG.strafeLead then
+        -- Short acceleration window: players do not keep accelerating
+        -- for several seconds at the same rate while running.
+        local aTime = math.min(t, .35)
+        move += Vector3.new(acceleration.X, 0, acceleration.Z)
+            * (.5 * aTime * aTime)
+    end
+
+    local aimAt = point + move
+    local state = humanoid and humanoid:GetState()
+    local inAir = humanoid and (
+        humanoid.FloorMaterial == Enum.Material.Air
+        or state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.Freefall
+        or state == Enum.HumanoidStateType.FallingDown
+    )
+
+    if CFG.airLead and inAir then
+        aimAt -= Vector3.new(0, .5 * workspace.Gravity * t * t, 0)
+
+        -- Do not predict a jumping player thousands of studs underground.
+        -- Estimate the first supporting surface immediately underneath.
+        if root then
+            if not groundCache.checked then
+                groundCache.checked = true
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {model, LP.Character}
+                params.IgnoreWater = true
+                local floorHit = workspace:Raycast(
+                    root.Position + Vector3.new(0, .1, 0),
+                    Vector3.new(0, -130, 0), params)
+                if floorHit and floorHit.Normal.Y > .55 then
+                    local hip = tonumber(humanoid.HipHeight) or 2
+                    groundCache.minimum = floorHit.Position.Y + hip
+                        + root.Size.Y * .5 + (point.Y - root.Position.Y)
+                end
+            end
+            if groundCache.minimum then
+                aimAt = Vector3.new(aimAt.X,
+                    math.max(aimAt.Y, groundCache.minimum), aimAt.Z)
+            end
+        end
+    end
+    return aimAt
+end
+
+local function rewrite(name, a, n)
+    local muzzle = a[1]
+    if typeof(muzzle) ~= "Vector3" or typeof(a[2]) ~= "Vector3" then return false end
+    if math.random(100) > CFG.hitChance then return false end
+    local target = S.target
+    if not target or os.clock() - S.targetTime > .22 then return false end
+
+    -- Fresh geometry at shot time rather than 45ms-old cached coordinates.
+    local model = target.model
+    if not model or not model.Parent or not alive(model) then return false end
+    local head = target.headPart and target.headPart.Parent == model and target.headPart
+        or model:FindFirstChild("Head")
+    local body = target.bodyPart and target.bodyPart.Parent == model and target.bodyPart
+        or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        or model:FindFirstChild("HumanoidRootPart")
+    local root = target.root and target.root.Parent == model and target.root
+        or model:FindFirstChild("HumanoidRootPart")
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local distance = root and (root.Position - muzzle).Magnitude or target.distance
+    local far = distance >= CFG.farBodyDistance
+    local headShot = math.random(100) <= CFG.headChance
+    if CFG.autoBodyFar and far then headShot = false end
+    local focus = headShot and (head or body) or (body or head)
+    if not focus then return false end
+    local currentPoint = focus.Position
+    local velocity = root and root.AssemblyLinearVelocity or target.velocity
+    local acceleration = root and motionHistory[root]
+        and motionHistory[root].acceleration or target.acceleration or Vector3.zero
+
+    local speed = Ballistics and tonumber(Ballistics.SPEED) or 1700
+    local arc = nil
+    if name == "FireSniper" then
+        speed = (Ballistics and tonumber(Ballistics.RIFLE_SPEED) or 2150)
+            * (S.velocityMultiplier or 1)
+        arc = Ballistics and Ballistics.RIFLE_ARC or nil
+    end
+    speed = math.max(100, speed)
+
+    local ping = S.networkPing * (CFG.pingFactor / 100)
+    local point = currentPoint
+    local travelTime = 0
+    local groundCache = {checked = false}
+    if CFG.longRangePrediction then
+        -- Fixed-point intercept iteration: target movement changes distance,
+        -- and distance changes bullet flight time in turn.
+        for _ = 1, 7 do
+            travelTime = flightTime((point - muzzle).Magnitude, speed, arc)
+            local total = math.min(CFG.maxPredictionTime, travelTime + ping)
+            point = predictTargetPosition(model, root, humanoid, currentPoint,
+                velocity, acceleration, total, groundCache)
+        end
+    end
+    S.lastFlightTime = travelTime
+    S.lastLeadDistance = (point - currentPoint).Magnitude
+
+    if not S.noRecoil then
+        point += Vector3.new(math.random(-7, 7), math.random(-7, 7),
+            math.random(-7, 7)) / 100
+    end
+    local delta = point - muzzle
+    if delta.Magnitude < .1 then return false end
+    local direction = delta.Unit
+    local aim = direction
+    if name == "FireSniper" and Ballistics
+        and type(Ballistics.launch) == "function" then
+        local ok, computed = pcall(Ballistics.launch, muzzle, point, speed, arc)
+        if ok and typeof(computed) == "Vector3" and computed.Magnitude > .5 then
+            aim = computed.Unit
+        end
+    end
+
+    if name == "FireShotgun" then
+        a[2] = direction
+        for i = 3, n do
+            if typeof(a[i]) == "Vector3" then a[i] = direction end
+        end
+    else
+        a[2] = aim
+        if typeof(a[4]) == "Vector3" then a[4] = direction end
+        if type(a[5]) == "number" then a[5] = 0 end
+    end
+    -- Use the predicted impact for visual tracer instead of stale body position.
+    return true, point
+end
+
+-- =====================================
+-- ZERO SPREAD: MAKE A SHOT FOLLOW THE SCREEN CENTER
+-- =====================================
+-- RifleClient generates a random spreadDir() BEFORE FireServer,
+-- so setting only the server cone (argument 5) to zero is not enough.
+-- We also replace the already-spread direction (argument 2) with a
+-- direction from the gun muzzle to the precise center-camera ray.
+-- No Raycast hook, no ammo/recoil/tracer cancellation.
+local function applyZeroSpread(name, a, n)
+    local muzzle = a[1]
+    if typeof(muzzle) ~= "Vector3" or typeof(a[2]) ~= "Vector3" then
+        return false
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+    local center = cam.ViewportSize * 0.5
+    local centerRay = cam:ViewportPointToRay(center.X, center.Y)
+    local aimPoint = centerRay.Origin + centerRay.Direction * 500
+    local diff = aimPoint - muzzle
+    if diff.Magnitude < 0.001 then return false end
+    local corrected = diff.Unit
+
+    -- Match the original RifleClient remote argument format.
+    a[2] = corrected
+    if name == "FireShotgun" then
+        -- All pellet direction vectors are aligned; keep other types intact.
+        for i = 3, n do
+            if typeof(a[i]) == "Vector3" then
+                a[i] = corrected
+            end
+        end
+    else
+        -- a[4] = center look vector; a[5] = random cone/spread.
+        if typeof(a[4]) == "Vector3" then
+            a[4] = centerRay.Direction
+        end
+        if type(a[5]) == "number" then
+            a[5] = 0
+        end
+    end
+    return true
+end
+
+-- Visual-only tracer adjustment, preserving the original Tracers implementation.
+local Tracers, oldTracerFire, tracerWrapper
+pcall(function()
+    local module = Voxel:FindFirstChild("Tracers")
+    if not module then return end
+    local result = require(module)
+    if type(result) ~= "table" or type(result.fire) ~= "function" then return end
+    Tracers, oldTracerFire = result, result.fire
+    tracerWrapper = function(from, to, ...)
+        if S.running and S.silent and CFG.visualTracers and S.visualShot
+            and typeof(from) == "Vector3" and typeof(to) == "Vector3" then
+            local shot = S.visualShot
+            if os.clock() - shot.time <= 0.4
+                and (from - shot.muzzle).Magnitude < 25 then
+                to = shot.position
+                S.visualShot = nil
+                S.visuals += 1
+            end
+        end
+        return oldTracerFire(from, to, ...)
+    end
+    Tracers.fire = tracerWrapper
+    S.tracerReady = Tracers.fire == tracerWrapper
+end)
+
+-- =====================================
+-- RAI GUI THEME
+-- =====================================
+local T = {
+    bg = Color3.fromRGB(8,9,10), side = Color3.fromRGB(6,7,8),
+    card = Color3.fromRGB(17,18,20), stroke = Color3.fromRGB(30,31,35),
+    text = Color3.fromRGB(240,242,243), muted = Color3.fromRGB(143,147,151),
+    active = Color3.fromRGB(23,24,27), blue = Color3.fromRGB(212,218,228),
+}
+local function make(kind, data)
+    local object = Instance.new(kind)
+    for property, value in pairs(data) do object[property] = value end
+    return object
+end
+local function radius(parent, px)
+    return make("UICorner", {Parent=parent, CornerRadius=UDim.new(0,px)})
+end
+local function outline(parent)
+    return make("UIStroke", {Parent=parent, Color=T.stroke, Thickness=1})
+end
+local function tween(object, duration, props)
+    local t = TweenService:Create(object,
+        TweenInfo.new(duration, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), props)
+    t:Play()
+    return t
+end
+local function lbl(parent, text, x, y, w, h, size, bold)
+    return make("TextLabel", {
+        Parent=parent, Position=UDim2.fromOffset(x,y), Size=UDim2.fromOffset(w,h),
+        BackgroundTransparency=1, Text=text, Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+        TextColor3=bold and T.text or T.muted, TextSize=size or 12,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    })
+end
+
+local parent = LP:WaitForChild("PlayerGui")
+pcall(function() if type(gethui) == "function" then parent = gethui() else parent = game:GetService("CoreGui") end end)
+local GUI = make("ScreenGui", {Name="SigmoCheatV11", Parent=parent, ResetOnSpawn=false,
+    IgnoreGuiInset=true, DisplayOrder=20, ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+local ESPGui = make("ScreenGui", {Name="SigmoBoxESPV11", Parent=parent, ResetOnSpawn=false,
+    IgnoreGuiInset=true, DisplayOrder=8})
+local FOVGui = make("ScreenGui", {Name="SigmoFOVV11", Parent=parent, ResetOnSpawn=false,
+    IgnoreGuiInset=true, DisplayOrder=10})
+local Circle = make("Frame", {Parent=FOVGui, AnchorPoint=Vector2.new(.5,.5),
+    Position=UDim2.fromScale(.5,.5), Size=UDim2.fromOffset(CFG.fov*2,CFG.fov*2),
+    BorderSizePixel=0, BackgroundTransparency=1, Visible=false})
+make("UICorner", {Parent=Circle, CornerRadius=UDim.new(1,0)})
+make("UIStroke", {Parent=Circle, Color=Color3.fromRGB(195,215,255),
+    Thickness=1.6, Transparency=.15})
+
+local Main = make("Frame", {Parent=GUI, AnchorPoint=Vector2.new(.5,.5),
+    Position=UDim2.fromScale(.5,.5), Size=UDim2.fromOffset(865,520),
+    BackgroundColor3=T.bg, BorderSizePixel=0, ClipsDescendants=true, Active=true})
+radius(Main,7) outline(Main)
+local Side = make("Frame", {Parent=Main, Size=UDim2.fromOffset(190,520),
+    BackgroundColor3=T.side, BorderSizePixel=0})
+outline(Side)
+local Logo = make("Frame", {Parent=Side, Position=UDim2.fromOffset(14,14),
+    Size=UDim2.fromOffset(34,34), BackgroundColor3=T.active, BorderSizePixel=0})
+radius(Logo,4) lbl(Logo,"S",10,3,23,27,18,true)
+lbl(Side,"Sigmo cheat",57,14,130,21,15,true)
+lbl(Side,"BLACK SNOW | V11",57,35,125,17,10,false)
+-- Tiny window lights, in the upper-left corner (like the reference).
+for i,color in ipairs({Color3.fromRGB(252,103,97),Color3.fromRGB(243,180,82),Color3.fromRGB(125,200,140)}) do
+    local dot=make("Frame",{Parent=Main,Position=UDim2.fromOffset(9+(i-1)*11,5),
+        Size=UDim2.fromOffset(4,4),BackgroundColor3=color,BorderSizePixel=0,ZIndex=5})
+    radius(dot,8)
+end
+make("Frame", {Parent=Side, Position=UDim2.fromOffset(12,63),
+    Size=UDim2.fromOffset(166,1), BackgroundColor3=T.stroke, BorderSizePixel=0})
+local TabsHolder = make("Frame", {Parent=Side, Position=UDim2.fromOffset(10,78),
+    Size=UDim2.fromOffset(170,335), BackgroundTransparency=1})
+make("UIListLayout",{Parent=TabsHolder, Padding=UDim.new(0,6),
+    SortOrder=Enum.SortOrder.LayoutOrder})
+local Topbar = make("Frame", {Parent=Main, Position=UDim2.fromOffset(205,8),
+    Size=UDim2.fromOffset(644,40), BackgroundTransparency=1, Active=true})
+local TopTitle = lbl(Topbar,"Combat",5,4,300,30,15,true)
+local Close = make("TextButton", {Parent=Topbar, Position=UDim2.fromOffset(603,4),
+    Size=UDim2.fromOffset(28,28), BackgroundColor3=Color3.fromRGB(28,29,32),
+    Text="X", Font=Enum.Font.GothamBold, TextSize=14, TextColor3=T.text,
+    AutoButtonColor=false, BorderSizePixel=0})
+radius(Close,3)
+local Content = make("Frame",{Parent=Main, Position=UDim2.fromOffset(205,58),
+    Size=UDim2.fromOffset(644,446), BackgroundTransparency=1})
+local Pages, Buttons = {}, {}
+local function newPage(name)
+    local p=make("Frame",{Name=name,Parent=Content,Size=UDim2.fromScale(1,1),
+        BackgroundTransparency=1,Visible=false})
+    Pages[name]=p return p
+end
+local function selectTab(name)
+    for n,p in pairs(Pages) do p.Visible=(n==name) end
+    for n,b in pairs(Buttons) do
+        local active=n==name
+        tween(b.bg,.18,{BackgroundTransparency=active and 0 or 1})
+        tween(b.text,.18,{TextColor3=active and T.text or T.muted})
+    end
+    TopTitle.Text=name
+end
+for _, item in ipairs({{"Information","i"},{"Combat","+"},{"ESP","o"},
+    {"World ESP","*"},{"Player","P"},{"World","W"},{"Settings","S"}}) do
+    local name,symbol=item[1],item[2]
+    local b=make("TextButton",{Parent=TabsHolder,Size=UDim2.fromOffset(170,36),
+        BackgroundColor3=T.active, BackgroundTransparency=1,BorderSizePixel=0,Text=""})
+    radius(b,3)
+    lbl(b,symbol,12,5,19,25,14,true)
+    local text=lbl(b,name,37,5,125,25,12,false)
+    Buttons[name]={bg=b,text=text}
+    bind(b.MouseButton1Click,function() selectTab(name) end)
+    newPage(name)
+end
+local function card(page,x,w,name)
+    local c=make("Frame",{Parent=page,Position=UDim2.fromOffset(x,0),
+        Size=UDim2.fromOffset(w,432),BackgroundColor3=T.card,BorderSizePixel=0})
+    radius(c,3) outline(c) lbl(c,name,15,11,w-30,25,13,true)
+    make("Frame",{Parent=c,Position=UDim2.fromOffset(14,39),
+        Size=UDim2.new(1,-28,0,1),BackgroundColor3=T.stroke,BorderSizePixel=0})
+    return c
+end
+local function toggle(parent,y,name,default,fn)
+    local row=make("Frame",{Parent=parent,Position=UDim2.fromOffset(15,y),
+        Size=UDim2.new(1,-30,0,36),BackgroundColor3=Color3.fromRGB(22,23,25),
+        BackgroundTransparency=0,BorderSizePixel=0})
+    radius(row,2)
+    lbl(row,name,8,3,215,28,11,false)
+    local bg=make("TextButton",{Parent=row,AnchorPoint=Vector2.new(1,.5),
+        Position=UDim2.new(1,-7,.5,0),Size=UDim2.fromOffset(39,20),
+        BackgroundColor3=default and T.text or Color3.fromRGB(66,68,74),
+        BorderSizePixel=0,Text="",AutoButtonColor=false})
+    radius(bg,20)
+    local dot=make("Frame",{Parent=bg,Size=UDim2.fromOffset(16,16),
+        Position=UDim2.fromOffset(default and 21 or 2,2),
+        BackgroundColor3=default and T.bg or T.text,BorderSizePixel=0})
+    radius(dot,20)
+    local value=default
+    local function set(v)
+        if fn and fn(v) == false then return end
+        value=v
+        tween(bg,.23,{BackgroundColor3=v and T.text or Color3.fromRGB(66,68,74)})
+        tween(dot,.23,{Position=UDim2.fromOffset(v and 21 or 2,2),
+            BackgroundColor3=v and T.bg or T.text})
+    end
+    bind(bg.MouseButton1Click,function() set(not value) end)
+    return {Set=set,Get=function() return value end}
+end
+local sliders={}
+local function slider(parent,y,name,min,max,value,fn)
+    local row=make("Frame",{Parent=parent,Position=UDim2.fromOffset(15,y),
+        Size=UDim2.new(1,-30,0,68),BackgroundColor3=Color3.fromRGB(22,23,25),
+        BorderSizePixel=0})
+    radius(row,2)
+    lbl(row,name,8,4,203,22,11,false)
+    local valueLabel=lbl(row,tostring(value),221,4,49,22,11,true)
+    valueLabel.TextXAlignment=Enum.TextXAlignment.Right
+    local track=make("Frame",{Parent=row,Position=UDim2.fromOffset(9,43),
+        Size=UDim2.new(1,-18,0,4),BackgroundColor3=Color3.fromRGB(64,67,73),BorderSizePixel=0})
+    radius(track,10)
+    local ratio=(value-min)/(max-min)
+    local fill=make("Frame",{Parent=track,Size=UDim2.fromScale(ratio,1),
+        BackgroundColor3=T.blue,BorderSizePixel=0})
+    radius(fill,10)
+    local knob=make("Frame",{Parent=track,AnchorPoint=Vector2.new(.5,.5),
+        Position=UDim2.fromScale(ratio,.5),Size=UDim2.fromOffset(13,13),
+        BackgroundColor3=T.text,BorderSizePixel=0})
+    radius(knob,10)
+    local hitbox=make("Frame",{Parent=row,Position=UDim2.fromOffset(0,28),
+        Size=UDim2.new(1,0,0,35),BackgroundTransparency=1,Active=true})
+    local state={ratio=ratio,display=ratio,fill=fill,knob=knob}
+    table.insert(sliders,state)
+    local drag=false
+    local function move(x)
+        local width=track.AbsoluteSize.X
+        if width<1 then return end
+        local alpha=math.clamp((x-track.AbsolutePosition.X)/width,0,1)
+        local v=math.floor(min+(max-min)*alpha+.5)
+        state.ratio=(v-min)/(max-min)
+        valueLabel.Text=tostring(v)
+        if fn then fn(v) end
+    end
+    bind(hitbox.InputBegan,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=true move(input.Position.X)
+        end
+    end)
+    bind(UIS.InputChanged,function(input)
+        if drag and input.UserInputType==Enum.UserInputType.MouseMovement then
+            move(input.Position.X)
+        end
+    end)
+    bind(UIS.InputEnded,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end
+    end)
+end
+
+-- =====================================
+-- BOX ESP: 0.5 STUDS OF MARGIN AROUND BODY
+-- =====================================
+local directions={{"LEFT -> RIGHT",0},{"RIGHT -> LEFT",180},
+    {"TOP -> BOTTOM",90},{"BOTTOM -> TOP",270}}
+local bodyNames={Head=true,HumanoidRootPart=true,Torso=true,UpperTorso=true,
+    LowerTorso=true,["Left Arm"]=true,["Right Arm"]=true,
+    ["Left Leg"]=true,["Right Leg"]=true,LeftUpperArm=true,
+    LeftLowerArm=true,LeftHand=true,RightUpperArm=true,
+    RightLowerArm=true,RightHand=true,LeftUpperLeg=true,
+    LeftLowerLeg=true,LeftFoot=true,RightUpperLeg=true,
+    RightLowerLeg=true,RightFoot=true}
+
+local function styleBox(entry)
+    local k=CFG.gradientStrength/100
+    entry.line.Thickness=1.8
+    entry.line.Color=CFG.gradientEnabled and Color3.new(1,1,1) or CFG.boxColor
+    entry.gradient.Enabled=CFG.gradientEnabled
+    entry.gradient.Rotation=directions[CFG.gradientDirection][2]
+    entry.gradient.Color=ColorSequence.new({
+        ColorSequenceKeypoint.new(0,CFG.boxColor),
+        ColorSequenceKeypoint.new(1,CFG.boxColor:Lerp(Color3.fromRGB(15,10,20),k)),
+    })
+end
+local preview
+local function refreshBoxStyle()
+    for _,box in pairs(S.boxes) do styleBox(box) end
+    if preview then styleBox(preview) end
+end
+local function removeBox(pl)
+    local entry=S.boxes[pl]
+    if entry then
+        S.boxes[pl]=nil
+        entry.frame:Destroy()
+    end
+end
+local function clearBoxes()
+    for pl in pairs(S.boxes) do removeBox(pl) end
+end
+local function newBox(pl)
+    local frame=make("Frame",{Name="Box_"..pl.Name,Parent=ESPGui,
+        Size=UDim2.fromOffset(1,1),Position=UDim2.fromOffset(0,0),
+        BackgroundTransparency=1,BorderSizePixel=0,Visible=false})
+    local line=make("UIStroke",{Parent=frame,ApplyStrokeMode=Enum.ApplyStrokeMode.Border})
+    local gradient=make("UIGradient",{Parent=line})
+    local entry={frame=frame,line=line,gradient=gradient}
+    S.boxes[pl]=entry
+    styleBox(entry)
+    return entry
+end
+
+local function bounds2D(character, cam)
+    local root=character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Torso")
+    if not root then return nil end
+    local pivot=root.CFrame
+    local lo=Vector3.new(math.huge,math.huge,math.huge)
+    local hi=Vector3.new(-math.huge,-math.huge,-math.huge)
+    local found=false
+    for _,part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") and bodyNames[part.Name] then
+            found=true
+            local half=part.Size*.5
+            for _,x in ipairs({-1,1}) do for _,y in ipairs({-1,1}) do for _,z in ipairs({-1,1}) do
+                local p=pivot:PointToObjectSpace(part.CFrame:PointToWorldSpace(
+                    Vector3.new(half.X*x,half.Y*y,half.Z*z)))
+                lo=Vector3.new(math.min(lo.X,p.X),math.min(lo.Y,p.Y),math.min(lo.Z,p.Z))
+                hi=Vector3.new(math.max(hi.X,p.X),math.max(hi.Y,p.Y),math.max(hi.Z,p.Z))
+            end end end
+        end
+    end
+    if not found then return nil end
+    local pad=Vector3.new(CFG.boxPadding,CFG.boxPadding,CFG.boxPadding)
+    lo -= pad
+    hi += pad
+    local minX,minY,maxX,maxY=math.huge,math.huge,-math.huge,-math.huge
+    for _,x in ipairs({lo.X,hi.X}) do for _,y in ipairs({lo.Y,hi.Y}) do
+        for _,z in ipairs({lo.Z,hi.Z}) do
+            local p=cam:WorldToViewportPoint(pivot:PointToWorldSpace(Vector3.new(x,y,z)))
+            if p.Z <= .05 then return nil end
+            minX=math.min(minX,p.X) minY=math.min(minY,p.Y)
+            maxX=math.max(maxX,p.X) maxY=math.max(maxY,p.Y)
+        end
+    end end
+    if maxX-minX < 1 or maxY-minY < 1 then return nil end
+    return minX,minY,maxX-minX,maxY-minY
+end
+
+bind(RunService.RenderStepped,function()
+    if not S.running then return end
+    if not S.esp then
+        if next(S.boxes) then clearBoxes() end
+        return
+    end
+    local cam=workspace.CurrentCamera
+    if not cam then return end
+    local current={}
+    for _,pl in ipairs(Players:GetPlayers()) do
+        if not visibleESP(pl) or not alive(pl.Character) then
+            removeBox(pl)
+        else
+            current[pl]=true
+            local entry=S.boxes[pl] or newBox(pl)
+            local ok,x,y,w,h=pcall(bounds2D,pl.Character,cam)
+            if ok and x then
+                entry.frame.Visible=true
+                entry.frame.Position=UDim2.fromOffset(x,y)
+                entry.frame.Size=UDim2.fromOffset(w,h)
+            else
+                entry.frame.Visible=false
+            end
+        end
+    end
+    for pl in pairs(S.boxes) do
+        if not current[pl] then removeBox(pl) end
+    end
+end)
+
+-- =====================================
+-- COMBAT & ESP PAGES
+-- =====================================
+local CL=card(Pages.Combat,0,310,"Silent Aim")
+local CR=card(Pages.Combat,322,310,"Motion Prediction")
+local CombatToggle=toggle(CL,48,"Enable Silent Aim",false,function(v)
+    if v and not S.hookReady then
+        warn("[RAI V10] Executor hook unavailable")
+        return false
+    end
+    S.silent = v
+    S.visualShot = nil
+end)
+slider(CL,102,"FOV (screen px)",CFG.minFov,CFG.maxFov,CFG.fov,
+    function(v) CFG.fov=v end)
+slider(CL,203,"Hit Chance %",0,100,CFG.hitChance,
+    function(v) CFG.hitChance=v end)
+slider(CL,304,"Head Chance %",0,100,CFG.headChance,
+    function(v) CFG.headChance=v end)
+toggle(CL,380,"Jump / Fall Prediction",CFG.airLead,
+    function(v) CFG.airLead=v end)
+
+toggle(CR,39,"Wall Check",CFG.wallcheck,function(v) CFG.wallcheck=v end)
+toggle(CR,81,"Wallbang Targets",CFG.wallbang,function(v) CFG.wallbang=v end)
+toggle(CR,123,"Target Bots",CFG.bots,function(v) CFG.bots=v end)
+toggle(CR,165,"Visual Tracers",CFG.visualTracers,function(v) CFG.visualTracers=v end)
+toggle(CR,207,"Show FOV Circle",S.showCircle,function(v) S.showCircle=v end)
+toggle(CR,249,"Predict Moving Targets",CFG.longRangePrediction,
+    function(v) CFG.longRangePrediction=v end)
+toggle(CR,291,"No Recoil + Zero Spread",false,function(v)
+    -- Zero Spread is the primary feature, so a FireServer hook is required.
+    -- Camera recoil suppression is additionally enabled if its module is patchable.
+    if v and not S.hookReady then
+        warn("[RAI V10] Zero Spread requires __namecall hook support")
+        return false
+    end
+    S.noRecoil = v
+    CFG.noRecoil = v
+    if v and not S.recoilReady then
+        warn("[RAI V10] Zero Spread is enabled; camera recoil module is unavailable")
+    end
+end)
+local CombatStatus=lbl(CR,"Aim: OFF | Spread: NORMAL",15,338,282,20,12,true)
+local TargetStatus=lbl(CR,"Target: NONE",15,360,282,18,11,false)
+local ShotStatus=lbl(CR,"Shots: 0 | Redirects: 0",15,380,282,18,11,false)
+local PingStatus=lbl(CR,"Ping: -- | Recoil: --",15,401,282,18,10,false)
+
+local EL=card(Pages.ESP,0,310,"Box ESP | 0.5 studs")
+local ER=card(Pages.ESP,322,310,"Gradient & Color")
+toggle(EL,48,"Enable Box ESP",false,function(v)
+    S.esp=v
+    if not v then clearBoxes() end
+end)
+toggle(EL,95,"Team ESP",CFG.espTeam,function(v) CFG.espTeam=v end)
+lbl(EL,"Box expands with distance on screen",15,161,280,22,11,false)
+lbl(EL,"Actual padding: 0.5 studs per side",15,190,280,22,11,false)
+lbl(EL,"Follows animated body parts",15,219,280,22,11,false)
+local BoxCount=lbl(EL,"Boxes: 0",15,365,280,22,12,true)
+toggle(ER,43,"Enable Gradient",CFG.gradientEnabled,
+    function(v) CFG.gradientEnabled=v refreshBoxStyle() end)
+slider(ER,96,"Gradient Strength %",0,100,CFG.gradientStrength,
+    function(v) CFG.gradientStrength=v refreshBoxStyle() end)
+lbl(ER,"Gradient Direction",15,181,265,20,12,false)
+local Dir=make("TextButton",{Parent=ER,Position=UDim2.fromOffset(15,209),
+    Size=UDim2.fromOffset(280,34),BackgroundColor3=Color3.fromRGB(40,40,46),
+    BorderSizePixel=0,Text=directions[CFG.gradientDirection][1],
+    Font=Enum.Font.GothamBold,TextSize=11,TextColor3=T.text})
+radius(Dir,2)
+bind(Dir.MouseButton1Click,function()
+    CFG.gradientDirection=CFG.gradientDirection % #directions + 1
+    Dir.Text=directions[CFG.gradientDirection][1]
+    refreshBoxStyle()
+end)
+lbl(ER,"Box Color",15,253,260,20,12,false)
+local colors={Color3.fromRGB(220,115,210),Color3.fromRGB(255,65,90),
+    Color3.fromRGB(255,255,255),Color3.fromRGB(80,170,255),
+    Color3.fromRGB(80,255,140),Color3.fromRGB(255,215,70),
+    Color3.fromRGB(170,105,255),Color3.fromRGB(255,140,70)}
+local function hex(color)
+    return string.format("#%02X%02X%02X",math.floor(color.R*255+.5),
+        math.floor(color.G*255+.5),math.floor(color.B*255+.5))
+end
+local Hex=make("TextBox",{Parent=ER,Position=UDim2.fromOffset(15,343),
+    Size=UDim2.fromOffset(280,34),BackgroundColor3=Color3.fromRGB(39,39,45),
+    BorderSizePixel=0,Text=hex(CFG.boxColor),PlaceholderText="#RRGGBB",
+    TextColor3=T.text,Font=Enum.Font.Gotham,TextSize=12,ClearTextOnFocus=false})
+radius(Hex,2)
+local function setBoxColor(c)
+    CFG.boxColor = c
+    Hex.Text = hex(c)
+    refreshBoxStyle()
+end
+for i,color in ipairs(colors) do
+    local swatch=make("TextButton",{Parent=ER,
+        Position=UDim2.fromOffset(15+(i-1)*36,290),
+        Size=UDim2.fromOffset(28,28),BackgroundColor3=color,
+        BorderSizePixel=0,Text=""})
+    radius(swatch,2)
+    bind(swatch.MouseButton1Click,function() setBoxColor(color) end)
+end
+bind(Hex.FocusLost,function()
+    local h=Hex.Text:gsub("#",""):gsub("%s+","")
+    if #h==6 and h:match("^[%x]+$") then
+        setBoxColor(Color3.fromRGB(tonumber(h:sub(1,2),16),
+            tonumber(h:sub(3,4),16),tonumber(h:sub(5,6),16)))
+    else
+        Hex.Text=hex(CFG.boxColor)
+    end
+end)
+local Preview=make("Frame",{Parent=ER,Position=UDim2.fromOffset(128,393),
+    Size=UDim2.fromOffset(50,24),BackgroundTransparency=1})
+preview={line=make("UIStroke",{Parent=Preview,
+    ApplyStrokeMode=Enum.ApplyStrokeMode.Border})}
+preview.gradient=make("UIGradient",{Parent=preview.line})
+refreshBoxStyle()
+
+local function info(page,title,lines)
+    local c=make("Frame",{Parent=page,Size=UDim2.fromOffset(632,310),
+        BackgroundColor3=T.card,BorderSizePixel=0})
+    radius(c,3) outline(c)
+    lbl(c,title,15,14,600,25,15,true)
+    for i,line in ipairs(lines) do lbl(c,line,20,56+(i-1)*30,600,24,12,false) end
+end
+info(Pages.Information,"Information",{
+    "SIGMO CHEAT V11 | Black Snow", "Predicts running, strafing, jumping and falling targets",
+    "ESP: 0.5-stud boxes, custom color, gradient and Team ESP",
+    "Server-enforced bullet range and collisions still apply.",
+})
+info(Pages["World ESP"],"World ESP",{"Reserved for world visual settings."})
+info(Pages.Player,"Player",{"Reserved for player settings."})
+info(Pages.World,"World",{"Reserved for world settings."})
+info(Pages.Settings,"Settings",{
+    "CTRL = Hide / Show menu", "X = Disable GUI, ESP, recoil patch and aim",
+    "No artificial target distance cap; server range still applies.",
+    "Jump gravity and strafe motion are client-side predictions.",
+})
+make("Frame",{Parent=Side,Position=UDim2.fromOffset(12,451),
+    Size=UDim2.fromOffset(166,1),BackgroundColor3=T.stroke,BorderSizePixel=0})
+lbl(Side,"SIGMO CHEAT",15,466,165,18,12,true)
+lbl(Side,"BLACK SNOW EDITION",15,484,165,18,10,false)
+
+
+-- =====================================
+-- SIGMO SNOWFALL: small, different sizes
+-- Purely visual; no hitbox or gameplay effect.
+-- =====================================
+local snowEnabled = true
+local SnowLayer=make("Frame",{Name="SnowLayer",Parent=Main,
+    Position=UDim2.fromOffset(0,0),Size=UDim2.fromScale(1,1),
+    BackgroundTransparency=1,BorderSizePixel=0,Active=false,Visible=true,ZIndex=45})
+local Snowflakes={}
+for i=1,45 do
+    local size=math.random(2,5)
+    local flake=make("Frame",{Name="Flake",Parent=SnowLayer,
+        BackgroundColor3=Color3.fromRGB(235,242,250),
+        BackgroundTransparency=math.random(28,76)/100,
+        BorderSizePixel=0,Size=UDim2.fromOffset(size,size),
+        Position=UDim2.fromOffset(math.random(0,865),math.random(-520,520)),
+        Active=false,ZIndex=45})
+    radius(flake,16)
+    Snowflakes[i]={object=flake,x=math.random(0,865),
+        y=math.random(-520,520),speed=math.random(17,43),
+        drift=math.random(-7,7)/10,phase=math.random()*6.283,sz=size}
+    flake.Position=UDim2.fromOffset(Snowflakes[i].x,Snowflakes[i].y)
+end
+
+-- Responsive scaling: keeps the whole menu visible on smaller screens.
+local WindowScale=make("UIScale",{Parent=Main,Scale=1})
+local lastScale=1
+local function updateWindowScale()
+    local cam=workspace.CurrentCamera
+    if not cam then return end
+    local screen=cam.ViewportSize
+    local scale=math.clamp(math.min((screen.X-28)/865,(screen.Y-28)/520),0.35,1)
+    if math.abs(scale-lastScale) > .005 then
+        lastScale=scale
+        WindowScale.Scale=scale
+    end
+end
+
+-- Separate Settings group for snow controls.
+local SnowSettings=make("Frame",{Parent=Pages.Settings,
+    Position=UDim2.fromOffset(0,322),Size=UDim2.fromOffset(632,110),
+    BackgroundColor3=T.card,BorderSizePixel=0})
+radius(SnowSettings,3) outline(SnowSettings)
+lbl(SnowSettings,"Snowfall",15,10,575,25,13,true)
+toggle(SnowSettings,50,"Falling snowflakes",true,function(v)
+    snowEnabled=v
+    SnowLayer.Visible=v
+end)
+
+-- =====================================
+-- FIRE HOOK: SAME SINGLE REMOTE INTERCEPTION AS WORKING V8
+-- =====================================
+local oldNamecall
+local function intercept(self,...)
+    if not S.running or not (S.silent or S.noRecoil) then
+        return oldNamecall(self,...)
+    end
+    if getnamecallmethod() ~= "FireServer" then return oldNamecall(self,...) end
+    local name=FIRE[self]
+    if not name then return oldNamecall(self,...) end
+    S.shots+=1
+    S.visualShot=nil
+    local args=table.pack(...)
+
+    -- Silent Aim still has priority when a real target was acquired.
+    local rewritten, visualPoint = false, nil
+    if S.silent then
+        local ok, changed, targetPoint = pcall(rewrite,name,args,args.n)
+        if ok and changed then
+            rewritten, visualPoint = true, targetPoint
+            S.modified += 1
+            if S.tracerReady and typeof(visualPoint)=="Vector3"
+                and typeof(args[1])=="Vector3" then
+                S.visualShot={muzzle=args[1],position=visualPoint,time=os.clock()}
+            end
+        elseif not ok then
+            S.errors += 1
+            warn("[RAI V10] Silent Aim rewrite failed:",changed)
+        end
+    end
+
+    if S.noRecoil then
+        if rewritten then
+            -- Silent Aim already replaced directions. Just neutralize
+            -- the cone value for weapons with the RifleClient signature.
+            if name ~= "FireShotgun" and type(args[5]) == "number" then
+                args[5] = 0
+            end
+            S.straightened += 1
+        else
+            -- Fires straight at the crosshair even with Silent Aim OFF,
+            -- or after a Hit Chance miss / no target.
+            local ok, changed = pcall(applyZeroSpread,name,args,args.n)
+            if ok and changed then
+                S.straightened += 1
+            elseif not ok then
+                S.errors += 1
+                warn("[RAI V10] Zero Spread rewrite failed:",changed)
+            end
+        end
+    end
+
+    -- Preserve the native shooting call, ammo, sounds and effects.
+    return oldNamecall(self,table.unpack(args,1,args.n))
+end
+if type(hookmetamethod)=="function" and type(getnamecallmethod)=="function" then
+    local callback=type(newcclosure)=="function" and newcclosure(intercept) or intercept
+    local ok,previous=pcall(hookmetamethod,game,"__namecall",callback)
+    if ok and type(previous)=="function" then
+        oldNamecall=previous
+        S.hookReady=true
+    else
+        warn("[RAI V10] Hook failed:",previous)
+    end
+end
+
+-- =====================================
+-- RENDER / STATUS
+-- =====================================
+local displayedFov=CFG.fov
+bind(RunService.RenderStepped,function(dt)
+    if not S.running then return end
+    local a=1-math.exp(-dt*15)
+    displayedFov+=(CFG.fov-displayedFov)*a
+    Circle.Size=UDim2.fromOffset(displayedFov*2,displayedFov*2)
+    Circle.Visible=S.silent and S.showCircle
+    for _,v in ipairs(sliders) do
+        v.display+=(v.ratio-v.display)*a
+        v.fill.Size=UDim2.fromScale(v.display,1)
+        v.knob.Position=UDim2.fromScale(v.display,.5)
+    end
+    updateWindowScale()
+    if snowEnabled then
+        local time=os.clock()
+        for _,f in ipairs(Snowflakes) do
+            f.y += f.speed*dt
+            f.x += f.drift*dt
+            if f.y>525 then
+                f.y=-f.sz-math.random(0,25)
+                f.x=math.random(0,865)
+            end
+            if f.x < -7 then f.x=870 end
+            if f.x > 870 then f.x=-7 end
+            local wobble=math.sin(time*1.2+f.phase)*1.3
+            f.object.Position=UDim2.fromOffset(f.x+wobble,f.y)
+        end
+    end
+end)
+local statusClock=0
+bind(RunService.Heartbeat,function(dt)
+    if not S.running then return end
+    statusClock+=dt
+    if statusClock<.25 then return end
+    statusClock=0
+    CombatStatus.Text="Aim: "..(S.silent and "ON" or "OFF").." | Spread: "..(S.noRecoil and "ZERO" or "NORMAL")
+    TargetStatus.Text=string.format("Target: %s | %.0f studs",S.targetName,S.targetDistance)
+    ShotStatus.Text=string.format("Shots: %d | Straight: %d | Aim: %d",
+        S.shots,S.straightened,S.modified)
+    PingStatus.Text=string.format("Ping: %.0fms | Flight: %.2fs | Lead: %.0f studs",
+        S.networkPing*1000, S.lastFlightTime, S.lastLeadDistance)
+    local count=0
+    for _,v in pairs(S.boxes) do if v.frame.Parent then count+=1 end end
+    BoxCount.Text="Boxes: "..count
+end)
+
+-- =====================================
+-- UNLOAD, DRAG, CTRL
+-- =====================================
+function S.Stop()
+    if not S.running then return end
+    S.running = false
+    S.silent = false
+    S.esp = false
+    S.noRecoil = false
+    S.target = nil
+    S.visualShot = nil
+    clearBoxes()
+    -- Restore the original module methods only if still owned by us.
+    for _, proto in ipairs(recoilPrototypes) do
+        local item = recoilOriginals[proto]
+        if item then
+            pcall(function()
+                if proto.shot == item.replacementShot then
+                    proto.shot = item.shot
+                end
+                if proto.step == item.replacementStep then
+                    proto.step = item.step
+                end
+            end)
+        end
+    end
+    if S.tracerReady and Tracers and Tracers.fire==tracerWrapper then
+        pcall(function() Tracers.fire=oldTracerFire end)
+    end
+    for _,c in ipairs(S.connections) do pcall(function() c:Disconnect() end) end
+    table.clear(S.connections)
+    ESPGui:Destroy()
+    FOVGui:Destroy()
+    GUI:Destroy()
+    if ENV.VoxelSilentAim==S then ENV.VoxelSilentAim=nil end
+    print("[RAI HUB V10] Unloaded")
+end
+bind(Close.MouseButton1Click,S.Stop)
+bind(UIS.InputBegan,function(input,processed)
+    if processed or not S.running then return end
+    if input.KeyCode==Enum.KeyCode.LeftControl
+        or input.KeyCode==Enum.KeyCode.RightControl then
+        GUI.Enabled=not GUI.Enabled
+    end
+end)
+local dragging,dragStart,startPos=false,nil,nil
+bind(Topbar.InputBegan,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = Main.Position
+    end
+end)
+bind(UIS.InputChanged,function(input)
+    if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+        local delta=input.Position-dragStart
+        Main.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,
+            startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+    end
+end)
+bind(UIS.InputEnded,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
+end)
+
+selectTab("Combat")
+Main.BackgroundTransparency=.2
+tween(Main,.3,{BackgroundTransparency=0})
+print("[SIGMO CHEAT V11] Black snow GUI loaded; original V10 functions retained")
